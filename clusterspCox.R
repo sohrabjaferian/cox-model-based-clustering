@@ -256,6 +256,11 @@ clustercox <- function(x, z, grp, time, event,
     
     # stabilize per SUBJECT (row-wise)
     log_ind  <- sweep(log_ind, 1, apply(log_ind, 1, max), "-")
+    
+    temp <- 1.5  # cool towards 1 over iterations if you like
+    log_ind <- log_ind / temp
+
+    
     ind.prob <- exp(log_ind)
     
     # normalize per SUBJECT (rows)
@@ -263,6 +268,26 @@ clustercox <- function(x, z, grp, time, event,
     membership  <- t(post_ig)                                  # G x N (what the rest expects)
     memb.prob   <- rowMeans(membership)                        # mixture weights π_g
 
+    
+    
+    # ---- reinit near-empty components (put this block here) ----
+    eps_pi <- 1e-6
+    for (g in 1:nCluster) {
+      if (memb.prob[g] < eps_pi) {
+        ref <- which.max(memb.prob)          # pick a healthy component as template
+        betaIter[[g]] <- betaIter[[ref]] + rnorm(length(betaIter[[ref]]), 0, 0.1)
+        LIter[[g]]    <- diag(diag(LIter[[ref]])) * runif(1, 0.8, 1.2)
+        DIter[[g]]    <- LIter[[g]] %*% t(LIter[[g]])
+        
+        # seed some soft responsibilities for this component
+        membership[g, ] <- eps_pi
+        seeds <- sample.int(ncol(membership), min(5, ncol(membership)))
+        membership[g, seeds] <- 1
+      }
+    }
+    # renormalize responsibilities and update mixture weights
+    membership <- sweep(membership, 2, colSums(membership), "/")
+    memb.prob  <- rowMeans(membership)
     
     
     
