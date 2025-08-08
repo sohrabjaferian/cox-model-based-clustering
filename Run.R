@@ -8,17 +8,17 @@ source("spcoxControl.R", keep.source = TRUE)
 
 
 
-# Step 1: Load the required RData file
+# Load the RData file
 load("sim_cox_fixed_clusters.RData")
 
-# Step 2: Extract variables from data3
+# Extract variables from data3
 time <- data3$time
 event <- data3$status
 grp <- data3$grp
 
-length(grp)                    # Should be 100 (or whatever nrow is)
-length(unique(grp))           # Should match above
-length(levels(grp))           # Could be more if it's a factor with unused levels
+length(grp)             
+length(unique(grp)) 
+length(levels(grp))
 
 
 # Covariates (fixed effects)

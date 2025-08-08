@@ -11,6 +11,18 @@ clustercox <- function(x, z, grp, time, event,
   penalty.b <- match.arg(penalty.b)
   penalty.L <- match.arg(penalty.L)
   
+  # ---- defaults for new control fields ----
+  ctrl <- modifyList(list(
+    tol = 1e-4,
+    lower = 1e-8, upper = 1e8,
+    maxIter = 10,
+    inner_maxit = 10,
+    armijo_c = 1e-4,          # sufficient decrease
+    armijo_rho = 0.5,         # backtracking shrink
+    a_init = 1.0,             # initial step
+    number = 5                # your active-set cycling trigger
+  ), control)
+  
   # ------ checks ------
   if (is.data.frame(x)) x <- as.matrix(x)
   if (is.data.frame(z)) z <- as.matrix(z)
@@ -48,65 +60,97 @@ clustercox <- function(x, z, grp, time, event,
   
   # ------ allocate ------
   grp <- factor(grp)
-  N   <- length(unique(grp))      # subjects
+  N   <- nrow(x)                 # per-row subjects in your current setup
   p   <- ncol(x)
   q   <- ncol(z)
-  ntot <- nrow(x)
+
+  # initial global scaling of lambdas; later rescaled by pi_g
+  lambda1_base <- lam1 * (N / nCluster)
+  lambda2_base <- lam2 * (N / nCluster)
   
-  # initial global scaling of lambdas (will be re-scaled by π_g later)
-  lambda1 <- lam1 * (N / nCluster)
-  lambda2 <- lam2 * (N / nCluster)
-  
-  # --- base per-subject lists: NO weighting/scaling here ---
-  xGrp <- lapply(seq_len(nrow(x)), function(i) matrix(x[i, ], nrow = 1))
-  zGrp <- lapply(seq_len(nrow(z)), function(i) matrix(z[i, ], nrow = 1))
-  yGrp <- lapply(seq_len(nrow(x)), function(i) {
+  # per-"subject" lists used by your cox_laplace_loglik
+  xGrp <- lapply(seq_len(N), function(i) matrix(x[i, ], nrow = 1))
+  zGrp <- lapply(seq_len(N), function(i) matrix(z[i, ], nrow = 1))
+  yGrp <- lapply(seq_len(N), function(i) {
     m <- matrix(c(time[i], event[i]), nrow = 1)
     colnames(m) <- c("time","event"); m
   })
   
-  # --- initial cluster labels via Mclust on X (no weights applied to data) ---
-  # --- initial cluster labels via Mclust on X ---
-  x_kmeans <- x[, -1, drop = FALSE]
-  ini.fit  <- Mclust(as.matrix(x_kmeans), G = nCluster)
+  # ---- initialization via Mclust on X (no weights) ----
+  ini.fit  <- mclust::Mclust(as.matrix(x[, -1, drop = FALSE]), G = nCluster)
+  post     <- pmax(ini.fit$z, 1e-12)
+  post     <- post / rowSums(post)
+  membership <- t(post)                      # G x N
+  memb.prob  <- rowMeans(membership)        # pi_g
   
-  # responsibilities: N x G -> G x N
-  post <- pmax(ini.fit$z, 1e-12)                 # N x G
-  post <- post / rowSums(post)                   # normalize per subject
-  membership <- t(post)                          # G x N
-  memb.prob  <- rowMeans(membership)
-  
-  betaStart  <- LStart <- DStart <- vector("list", nCluster)
-  fctStart   <- numeric(nCluster)
+  # ---- helpers ----
+  scad_deriv <- function(t, lam, a = 3.7) {
+    if (t <= lam) return(lam)
+    if (t <= a * lam) return((a * lam - t) / (a - 1))
+    0
+  }
   
   pen_obj <- function(beta, L, w, lam1_i, lam2_i) {
     D <- L %*% t(L)
     ll <- cox_laplace_loglik(xGrp, yGrp, zGrp, beta, D, wGroup = w)$loglik
-    pen_b <- if (penalty.b == "lasso") lam1_i * sum(abs(beta[-nonpen.b])) else sum(scad_group(beta[-nonpen.b], lam1_i))
-    L2 <- sum(apply(L[-nonpen.L, , drop = FALSE], 1, function(r) sqrt(sum(r^2))))
-    pen_L <- if (penalty.L == "lasso") lam2_i * L2 else sum(scad_group(L2, lam2_i))
-    -ll + pen_b + pen_L
+    # beta penalty (intercept non-penalized)
+    if (penalty.b == "lasso") {
+      pen_b <- lam1_i * sum(abs(beta[-nonpen.b]))
+    } else {
+      # LLA on SCAD: use derivative*|beta| surrogate (classic local linear approx)
+      pen_b <- sum(sapply(setdiff(seq_along(beta), nonpen.b), function(j) {
+        wj <- scad_deriv(abs(beta[j]), lam1_i)
+        wj * abs(beta[j])
+      }))
+    }
+    # group penalty on rows of L (by row ℓ2 norm), with nonpen rows exempt
+    row_norms <- apply(L, 1, function(r) sqrt(sum(r^2)))
+    if (penalty.L == "lasso") {
+      pen_L <- lam2_i * sum(row_norms[setdiff(seq_len(q), nonpen.L)])
+    } else {
+      pen_L <- sum(sapply(setdiff(seq_len(q), nonpen.L), function(l) {
+        wl <- scad_deriv(row_norms[l], lam2_i)
+        wl * row_norms[l]
+      }))
+    }
+    -(ll) + pen_b + pen_L
   }
   
-  cat("fitting ...\n")
-  pb <- txtProgressBar(min = 0, max = nCluster, style = 3)
-  for (g in 1:nCluster) {
-    w_g <- as.numeric(membership[g, ])  # length N
-    
-    yi <- Surv(time, event)
-    betaStart[[g]] <- tryCatch({
-      fit <- glmnet(
+  # curvature proxy for β_j (positive)
+  Hjj_fun <- function(j, Xst, Yst, beta, w) {
+    timev <- Yst[,1]; eventv <- Yst[,2]
+    ord <- order(timev, -eventv)
+    r   <- exp(as.vector(Xst %*% beta))
+    r   <- r[ord]; w  <- w[ord]; xj <- Xst[ord, j]
+    tme <- timev[ord]; evt <- eventv[ord]
+    val <- 0
+    for (i in which(evt == 1)) {
+      Ri <- which(tme >= tme[i])
+      wr <- w[Ri] * r[Ri]; den <- sum(wr); if (!is.finite(den) || den <= 0) next
+      mu  <- sum(xj[Ri] * wr) / den
+      e2  <- sum((xj[Ri]^2) * wr) / den
+      val <- val + w[i] * (e2 - mu^2)
+    }
+    max(val, ctrl$lower)
+  }
+  
+  # ---- initialize beta/L/D per cluster (like before) ----
+  betaIter <- LIter <- DIter <- vector("list", nCluster)
+  for (g in seq_len(nCluster)) {
+    w_g <- as.numeric(membership[g, ])
+    yi  <- Surv(time, event)
+    betaIter[[g]] <- tryCatch({
+      fit <- glmnet::glmnet(
         x = x[, -1, drop = FALSE], y = yi, family = "cox",
-        lambda = lambda1[g],
-        alpha  = if (penalty.b == "lasso") 1 else 0,
+        lambda = lambda1_base[g], alpha = if (penalty.b == "lasso") 1 else 0,
         weights = pmax(w_g, 1e-6)
       )
       c(0, as.numeric(fit$beta[, 1]))
     }, error = function(e) {
-      fit2 <- tryCatch(coxph(yi ~ x[, -1], weights = pmax(w_g, 1e-6), ties = "breslow"),
+      fit2 <- tryCatch(survival::coxph(yi ~ x[, -1], weights = pmax(w_g, 1e-6), ties = "breslow"),
                        error = function(e2) NULL)
       if (!is.null(fit2)) {
-        b <- coef(fit2); bb <- rep(0, ncol(x) - 1)
+        b <- stats::coef(fit2); bb <- rep(0, ncol(x) - 1)
         nm <- intersect(names(b), colnames(x)[-1])
         bb[match(nm, colnames(x)[-1])] <- b[nm]
         return(c(0, bb))
@@ -114,209 +158,153 @@ clustercox <- function(x, z, grp, time, event,
       rep(0, ncol(x))
     })
     
-    # init D from your updated helper (pass weights, don't pass zId/N if your new signature dropped them)
-    covInit <- covStartingValues(xGrp, yGrp, zGrp, b = betaStart[[g]], wGroup = w_g)
+    covInit <- covStartingValues(xGrp, yGrp, zGrp, b = betaIter[[g]], wGroup = w_g)
     tau <- if (is.finite(covInit$tau)) covInit$tau else 1
-    DStart[[g]] <- diag(tau, ncol(z))
-    LStart[[g]] <- chol(DStart[[g]])
-    
-    fctStart[g] <- pen_obj(betaStart[[g]], LStart[[g]], w_g, lambda1[g], lambda2[g])
+    DIter[[g]] <- diag(tau, ncol(z))
+    LIter[[g]] <- chol(DIter[[g]])
   }
   
-  
-  
-  betaIter <- betaStart
-  LIter    <- LStart
-  DIter    <- DStart
-  LvecIter <- lapply(LStart, function(L) L[lower.tri(L, TRUE)])
-  
-  fctIter   <- fctStart
-  covIter   <- LvecIter
-  converged <- 0
-  counter   <- 0
-  counterIn <- 0
-  doAll     <- FALSE
-  convFct2  <- -10
-  
+  # ---------- EM loop ----------
+  outer <- 0
   repeat {
-    if (!(counter < control$maxIter && (convFct2 < 0 || counter < 1))) break
-    counter <- counter + 1
+    outer <- outer + 1
     
-    betaOld <- betaIter; LOld <- LIter; fctOld <- fctIter; covOld <- covIter
+    # scale lambdas by cluster mass (π_g)
+    lambda1_eff <- lambda1_base * memb.prob
+    lambda2_eff <- lambda2_base * memb.prob
     
-    activeSet <- lapply(betaIter, function(b) which(b != 0))
-    if (counterIn == 0 || counterIn > control$number) {
-      doAll <- TRUE
-      activeSet <- lapply(activeSet, function(.) seq_len(p))
-      counterIn <- 1
-    } else {
-      doAll <- FALSE
-      counterIn <- counterIn + 1
-    }
+    fct_before <- sum(mapply(function(b, L, w, l1, l2)
+      pen_obj(b, L, w, l1, l2),
+      betaIter, LIter, as.data.frame(t(membership)), lambda1_eff, lambda2_eff))
     
-    # ------------------ M-step ------------------
-    for (g in 1:nCluster) {
-      w_g <- membership[g, ]
+    # ------------------ M-step: for each g, fully CGD until convergence ------------------
+    for (g in seq_len(nCluster)) {
+      w_g <- as.numeric(membership[g, ])
+      Xst <- x; Zst <- z; Yst <- cbind(time, event)
+      beta_g <- betaIter[[g]]
+      L_g    <- LIter[[g]]
       
-      Xst <- x
-      Zst <- z
-      Yst <- cbind(time, event)
-      
-      # curvature proxy for β: diagonal info (stable & >0)
-      Hjj <- function(j) {
-        # event-wise Var_w(x_j) accumulation with weights w_g
-        timev <- Yst[,1]; eventv <- Yst[,2]
-        ord <- order(timev, -eventv)
-        r   <- exp(as.vector(Xst %*% betaIter[[g]]))
-        r   <- r[ord]; w  <- w_g[ord]; xj <- Xst[ord, j]
-        tme <- timev[ord]; evt <- eventv[ord]
-        val <- 0
-        for (i in which(evt == 1)) {
-          Ri <- which(tme >= tme[i])
-          wr <- w[Ri] * r[Ri]; den <- sum(wr); if (!is.finite(den) || den <= 0) next
-          mu  <- sum(xj[Ri] * wr) / den
-          e2  <- sum((xj[Ri]^2) * wr) / den
-          val <- val + w[i] * (e2 - mu^2)
-        }
-        max(val, control$lower)
-      }
-      
-      activeSet[[g]] <- if (doAll) seq_len(ncol(Xst)) else which(betaIter[[g]] != 0)
-      for (j in activeSet[[g]]) {
-        score <- cox_partial_score_component(x = Xst, y = Yst, beta = betaIter[[g]], j = j, w = w_g)
-        Hj    <- Hjj(j)
-        if (j %in% nonpen.b) {
-          betaIter[[g]][j] <- score / Hj
-        } else if (penalty.b == "lasso") {
-          betaIter[[g]][j] <- SoftThreshold(score, lambda1[g]) / Hj
-        } else {
-          scada <- 3.7
-          betaIter[[g]][j] <- SoftThreshold(score, lambda1[g]) / (Hj * (1 - 1 / scada))
-        }
-      }
-      betaIter[[g]][!is.finite(betaIter[[g]])] <- 0
-      betaIter[[g]][abs(betaIter[[g]]) < 0.05] <- 0
-      
-      
-      # ---- L update (group penalty) ----
-      D.grad <- D_Gradient(xGrp, zGrp, NULL, yGrp, b = betaIter[[g]], wGroup = w_g)
-      D.hessian <- D_HessianMatrix(xGrp, zGrp, NULL, yGrp, b = betaIter[[g]], q = ncol(z), wGroup = w_g)
-      L.grad <- t(LIter[[g]] %*% (D.grad + t(D.grad)))
-
-      
-      # simple diagonal curvature for stability
-      for (k in 1:q) {
-        for (l in k:q) {
-          L.lk.grad  <- L.grad[l, k]
-          L.lk.Hess  <- max(control$lower, min(control$upper, D.hessian[l, l]))
+      inner <- 0
+      repeat {
+        inner <- inner + 1
+        beta_old <- beta_g
+        L_old    <- L_g
+        
+        # ---- β update (coordinate-wise with Armijo) ----
+        active_b <- seq_len(p)  # doAll every time to match spec
+        for (j in active_b) {
+          # gradient component (score) and curvature proxy
+          score_j <- cox_partial_score_component(x = Xst, y = Yst, beta = beta_g, j = j, w = w_g)
+          Hj      <- Hjj_fun(j, Xst, Yst, beta_g, w_g)
           
-          linNonpen <- l %in% nonpen.L
-          # one-step group update with pseudo-Armijo
-          if (linNonpen) {
-            dk <- - L.lk.grad / L.lk.Hess
+          # proximal "full step" target for this coord
+          beta_star_j <- if (j %in% nonpen.b) {
+            beta_g[j] + score_j / Hj
+          } else if (penalty.b == "lasso") {
+            SoftThreshold(beta_g[j] + score_j / Hj, lambda1_eff[g] / Hj)
           } else {
-            row_norm <- sqrt(sum(LIter[[g]][l, ]^2))
-            if (row_norm == 0) row_norm <- 1e-8
-            if (penalty.L == "lasso") {
-              dk <- (-L.lk.grad - lambda2[g] / row_norm * LIter[[g]][l, k]) /
-                (L.lk.Hess + lambda2[g] / row_norm)
-            } else {
-              # SCAD group — approximate with same form but replace lambda2 with
-              # its SCAD derivative scaling at row-norm.
-              a <- 3.7
-              deriv_scale <- if (row_norm <= lambda2[g]) 1 else if (row_norm <= a*lambda2[g]) (a*lambda2[g]-row_norm)/((a-1)*row_norm) else 0
-              dk <- (-L.lk.grad - deriv_scale * LIter[[g]][l, k]) /
-                (L.lk.Hess + max(deriv_scale, 1e-8))
-            }
+            # SCAD-LLA: weight = scad_deriv(|beta_j|, lambda), prox-l1 with that weight
+            wj <- scad_deriv(abs(beta_g[j]), lambda1_eff[g])
+            SoftThreshold(beta_g[j] + score_j / Hj, wj / Hj)
           }
-          step <- control$a_init
-          LIter[[g]][l, k] <- LIter[[g]][l, k] + step * dk
+          
+          d_j <- beta_star_j - beta_g[j]
+          if (!is.finite(d_j) || d_j == 0) next
+          
+          # Armijo backtracking along this coordinate
+          a <- ctrl$a_init
+          obj0 <- pen_obj(beta_g, L_g, w_g, lambda1_eff[g], lambda2_eff[g])
+          repeat {
+            beta_try <- beta_g
+            beta_try[j] <- beta_g[j] + a * d_j
+            obj1 <- pen_obj(beta_try, L_g, w_g, lambda1_eff[g], lambda2_eff[g])
+            if (is.finite(obj1) && obj1 <= obj0 - ctrl$armijo_c * a * abs(obj0)) break
+            a <- a * ctrl$armijo_rho
+            if (a < 1e-8) break
+          }
+          beta_g[j] <- beta_g[j] + a * d_j
         }
+        
+        # ---- L update (row-wise group with Armijo) ----
+        # gradients/Hessian proxies from your helpers
+        D.grad     <- D_Gradient(xGrp, zGrp, NULL, yGrp, b = beta_g, wGroup = w_g)
+        D.hessian  <- D_HessianMatrix(xGrp, zGrp, NULL, yGrp, b = beta_g, q = ncol(z), wGroup = w_g)
+        L_grad     <- t(L_g %*% (D.grad + t(D.grad)))   # same as before
+        
+        for (l in seq_len(q)) {
+          g_l   <- as.numeric(L_grad[l, ])
+          # curvature proxy for row l: positive scalar (use diag block or safe lower bound)
+          H_l   <- max(ctrl$lower, min(ctrl$upper, D.hessian[l, l]))
+          
+          # unpenalized gradient step for the whole row
+          l_tilde <- L_g[l, ] - (1 / H_l) * g_l
+          
+          # group shrink (lasso or SCAD-LLA on row norm)
+          if (l %in% nonpen.L) {
+            l_star <- l_tilde
+          } else {
+            rn <- sqrt(sum(l_tilde^2))
+            if (penalty.L == "lasso") {
+              shrink <- max(0, 1 - (lambda2_eff[g] / (H_l * rn)))
+            } else {
+              w_row  <- scad_deriv(sqrt(sum(L_g[l, ]^2)), lambda2_eff[g])
+              shrink <- max(0, 1 - (w_row / (H_l * rn)))
+            }
+            l_star <- shrink * l_tilde
+          }
+          
+          d_l <- l_star - L_g[l, ]
+          if (!all(is.finite(d_l)) || all(abs(d_l) < 1e-15)) next
+          
+          # Armijo backtracking along the row direction
+          a <- ctrl$a_init
+          obj0 <- pen_obj(beta_g, L_g, w_g, lambda1_eff[g], lambda2_eff[g])
+          repeat {
+            L_try <- L_g
+            L_try[l, ] <- L_g[l, ] + a * d_l
+            obj1 <- pen_obj(beta_g, L_try, w_g, lambda1_eff[g], lambda2_eff[g])
+            if (is.finite(obj1) && obj1 <= obj0 - ctrl$armijo_c * a * abs(obj0)) break
+            a <- a * ctrl$armijo_rho
+            if (a < 1e-8) break
+          }
+          L_g[l, ] <- L_g[l, ] + a * d_l
+        }
+        
+        # check inner convergence
+        max_beta <- max(abs(beta_g - beta_old))
+        max_L    <- max(abs(L_g - L_old))
+        if (max(max_beta, max_L) <= ctrl$tol || inner >= ctrl$inner_maxit) break
       }
       
-      LIter[[g]][abs(LIter[[g]]) < 1e-2] <- 0
-      DIter[[g]]  <- LIter[[g]] %*% t(LIter[[g]])
-      LvecIter[[g]] <- LIter[[g]][lower.tri(LIter[[g]], TRUE)]
-      
-      # new objective
-      fctIter[g] <- pen_obj(betaIter[[g]], LIter[[g]], w_g, lambda1[g], lambda2[g])
-    }
+      betaIter[[g]] <- beta_g
+      LIter[[g]]    <- L_g
+      DIter[[g]]    <- L_g %*% t(L_g)
+    } # end M-step
     
-    # ------------------ E-step ------------------             # <<< CHANGED
-    # p(y_i | X_i, Θ_g) for each i,g using *unweighted* subject i
-    # --- E-step (compute responsibilities) ---
+    # ------------------ E-step (exact, no temperature, no reseed) ------------------
     log_ind <- sapply(seq_len(nCluster), function(g) {
       ll_i <- mapply(function(xi, yi, zi) {
         cox_laplace_loglik(list(xi), list(yi), list(zi),
                            betaIter[[g]], DIter[[g]])$loglik
       }, xGrp, yGrp, zGrp)
       log(pmax(memb.prob[g], 1e-12)) + ll_i
-    })
-    # log_ind is N x G
-    
-    # stabilize per SUBJECT (row-wise)
-    log_ind  <- sweep(log_ind, 1, apply(log_ind, 1, max), "-")
-    
-    temp <- 1.5  # cool towards 1 over iterations if you like
-    log_ind <- log_ind / temp
-
-    
+    })               # N x G
+    # stabilize and normalize row-wise
+    log_ind <- sweep(log_ind, 1, apply(log_ind, 1, max), "-")
     ind.prob <- exp(log_ind)
-    
-    # normalize per SUBJECT (rows)
-    post_ig     <- sweep(ind.prob, 1, rowSums(ind.prob), "/")  # N x G
-    membership  <- t(post_ig)                                  # G x N (what the rest expects)
-    memb.prob   <- rowMeans(membership)                        # mixture weights π_g
-
-    
-    
-    # ---- reinit near-empty components (put this block here) ----
-    eps_pi <- 1e-6
-    for (g in 1:nCluster) {
-      if (memb.prob[g] < eps_pi) {
-        ref <- which.max(memb.prob)          # pick a healthy component as template
-        betaIter[[g]] <- betaIter[[ref]] + rnorm(length(betaIter[[ref]]), 0, 0.1)
-        LIter[[g]]    <- diag(diag(LIter[[ref]])) * runif(1, 0.8, 1.2)
-        DIter[[g]]    <- LIter[[g]] %*% t(LIter[[g]])
-        
-        # seed some soft responsibilities for this component
-        membership[g, ] <- eps_pi
-        seeds <- sample.int(ncol(membership), min(5, ncol(membership)))
-        membership[g, seeds] <- 1
-      }
-    }
-    # renormalize responsibilities and update mixture weights
-    membership <- sweep(membership, 2, colSums(membership), "/")
+    post_ig  <- sweep(ind.prob, 1, rowSums(ind.prob), "/")   # N x G
+    membership <- t(post_ig)                                  # G x N
     memb.prob  <- rowMeans(membership)
     
+    # convergence check on penalized objective
+    fct_after <- sum(mapply(function(b, L, w, l1, l2)
+      pen_obj(b, L, w, l1, l2),
+      betaIter, LIter, as.data.frame(t(membership)), 
+      lambda1_base * memb.prob, lambda2_base * memb.prob))
     
-    
-    # rescale lambdas by cluster mass
-    # lambda1 <- rep(lam1, nCluster)  # or lam1 * (N/nCluster)
-    # lambda2 <- rep(lam2, nCluster)  # or lam2 * (N/nCluster)
-    # lambda1 <- rep_len(lam1, nCluster)
-    # lambda2 <- rep_len(lam2, nCluster)
-    lambda1_eff <- lambda1 * memb.prob
-    lambda2_eff <- lambda2 * memb.prob
-    
-    
-    # then use lambda1_eff[g], lambda2_eff[g] in the M-step,
-    # but keep lambda1/lambda2 unchanged for returning in fit$lambda*
-    
-    # ------------- convergence checks -------------
-    convPar <- max(mapply(function(a,b) sqrt(crossprod(a-b))/(1+sqrt(crossprod(a))),
-                          betaIter, betaOld))
-    convFct  <- abs((sum(fctOld) - sum(fctIter)) / (1 + abs(sum(fctIter))))
-    convFct2 <- sum(fctIter) - sum(fctOld)
-    convCov  <- max(mapply(function(a,b) sqrt(crossprod(a-b)), LvecIter, covOld))
-    
-    if (!any(is.na(c(convPar, convFct, convCov))) &&
-        convPar <= control$tol && convFct <= control$tol && convCov <= control$tol) {
-      counterIn <- 0
-    }
-    
-    if (counter >= control$maxIter) break
-  } # end repeat
+    rel_dec <- abs(fct_before - fct_after) / (1 + abs(fct_after))
+    if (!is.finite(rel_dec) || rel_dec < ctrl$tol || outer >= ctrl$maxIter) break
+  } # EM repeat
   
   # ------ unstandardize coefficients back to original scale ------
   if (standardize) {
@@ -328,37 +316,28 @@ clustercox <- function(x, z, grp, time, event,
     x <- xOr; z <- zOr
   }
   
-  # ------ final model fit metrics (using weighted objective) ------
-  npar <- sum(unlist(lapply(betaIter, function(b) sum(b != 0)))) + length(unlist(LvecIter))
+  # ------ final metrics ------
+  npar <- sum(unlist(lapply(betaIter, function(b) sum(b != 0)))) +
+    sum(unlist(lapply(LIter, function(L) length(L))))
   
   logLik <- sum(mapply(function(beta, L, w) {
-    cox_laplace_loglik(
-      xGroup = xGrp, yGroup = yGrp, zGroup = zGrp,
-      beta = beta, D = L %*% t(L), wGroup = w
-    )$loglik
-  }, betaIter, LIter, as.data.frame(t(membership)) ))          # membership rows as w
+    cox_laplace_loglik(xGroup = xGrp, yGroup = yGrp, zGroup = zGrp,
+                       beta = beta, D = L %*% t(L), wGroup = w)$loglik
+  }, betaIter, LIter, as.data.frame(t(membership))))
   
   deviance <- -2 * logLik
   aic <- -2 * logLik + 2 * npar
-  bic <- -2 * logLik + log(ntot) * npar
-  
-  p.nz <- sum(unlist(lapply(betaIter, function(b) sum(b != 0))))
-  q.nz <- sum(unlist(lapply(DIter, function(D) sum(diag(D) != 0))))
-  bbic <- -2 * logLik + max(1, log(log(p.nz + q.nz))) * log(ntot) * npar
-  ebic <- -2 * logLik + (log(ntot) + 2 * log(p.nz + q.nz)) * npar
+  bic <- -2 * logLik + log(N) * npar
   
   out <- list(
     data = list(x = x, y = y, z = z, grp = grp),
-    membership = membership,
+    membership = membership, pi = memb.prob,
     penalty.b = penalty.b, penalty.L = penalty.L,
     nonpen.b = nonpen.b, nonpen.L = nonpen.L,
-    lambda1 = lambda1, lambda2 = lambda2,
-    Lvec = LvecIter,
-    coefficients = betaIter, D = DIter,
-    converged = converged,
-    logLik = logLik, npar = npar,
-    deviance = deviance, aic = aic, bic = bic, bbic = bbic, ebic = ebic,
-    counter = counter, control = control, call = match.call()
+    lambda1 = lambda1_base, lambda2 = lambda2_base,
+    coefficients = betaIter, L = LIter, D = lapply(LIter, function(L) L %*% t(L)),
+    logLik = logLik, npar = npar, deviance = deviance, aic = aic, bic = bic,
+    iters = outer, control = ctrl, call = match.call()
   )
   structure(out, class = "spcox")
 }
