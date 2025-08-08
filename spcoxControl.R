@@ -1,5 +1,5 @@
 spCoxControl <-
-  function(tol=10^(-3),trace=1,maxIter=100,maxArmijo=20,number=5,a_init=1,
+  function(tol=10^(-3),trace=1,maxIter=1000,maxArmijo=20,number=5,a_init=1,
            delta=0.1,rho=0.001,gamma=0,lower=10^(-6),upper=10^8,seed=532,VarInt=c(0,10),CovInt=c(-5,5),thres=10^(-4))
   {
     

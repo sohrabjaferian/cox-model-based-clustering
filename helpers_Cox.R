@@ -28,13 +28,167 @@ multiplication <- function(x, y) {
 
 
 
+# ================================
+# 1) frailty_gradient_hessian
+# ================================
+# Gradient/Hessian of the weighted Cox partial loglik w.r.t. u
+# (with linear predictor eta = X b + Z u), Breslow handling.
+frailty_gradient_hessian <- function(x, y, z, beta, u,
+                                     w = NULL, ridge = 1e-10) {
+  if (!is.matrix(x) || !is.matrix(z) || !is.matrix(y))
+    stop("x, y, z must be matrices")
+  if (ncol(y) < 2) stop("y must have columns: time, event")
+  
+  n  <- nrow(x)
+  q  <- ncol(z)
+  if (is.null(w)) w <- rep(1, n)
+  
+  time  <- y[, 1]
+  event <- y[, 2]
+  
+  # Order: increasing time, events first (Breslow-like)
+  ord   <- order(time, -event)
+  x <- x[ord, , drop = FALSE]
+  z <- z[ord, , drop = FALSE]
+  time  <- time[ord]
+  event <- event[ord]
+  w     <- w[ord]
+  
+  eta  <- as.vector(x %*% beta + z %*% u)
+  r    <- exp(eta)
+  
+  grad <- numeric(q)
+  hess <- matrix(0, q, q)
+  
+  ev_idx <- which(event == 1)
+  for (i in ev_idx) {
+    Ri <- which(time >= time[i])
+    
+    wr    <- w[Ri] * r[Ri]
+    denom <- sum(wr)
+    if (!is.finite(denom) || denom <= 0) next
+    
+    Zi <- z[Ri, , drop = FALSE]
+    
+    # E_w[Z] and E_w[ZZ^T] under weights proportional to wr
+    mu  <- colSums(Zi * wr) / denom
+    Ezz <- crossprod(Zi, Zi * (wr / denom))
+    
+    # Score and observed info in u-direction
+    grad <- grad + w[i] * (z[i, ] - mu)
+    hess <- hess - w[i] * (Ezz - tcrossprod(mu))
+  }
+  
+  # Symmetrize / tiny ridge
+  hess <- (hess + t(hess)) / 2
+  if (any(!is.finite(hess))) {
+    hess[!is.finite(hess)] <- 0
+    hess <- hess + diag(ridge, q)
+  }
+  
+  list(grad = grad, hess = hess, eta = eta)
+}
 
 
-# ZIdentity <- function(Z)
-# {
-#   ZId <- diag(dim(Z)[[1]])
-#   return(list(ZId))
-# }
+# ==========================================
+# 2) cox_partial_score_component (for beta_j)
+# ==========================================
+cox_partial_score_component <- function(x, y, beta, j, w = NULL) {
+  if (!is.matrix(x) || !is.matrix(y)) stop("x and y must be matrices")
+  if (ncol(y) < 2) stop("y must have columns: time, event")
+  
+  n <- nrow(x)
+  if (is.null(w)) w <- rep(1, n)
+  
+  time  <- y[, 1]
+  event <- y[, 2]
+  
+  ord   <- order(time, -event)
+  x <- x[ord, , drop = FALSE]
+  time  <- time[ord]
+  event <- event[ord]
+  w     <- w[ord]
+  
+  eta <- as.vector(x %*% beta)
+  r   <- exp(eta)
+  
+  score <- 0
+  ev_idx <- which(event == 1)
+  for (i in ev_idx) {
+    Ri <- which(time >= time[i])
+    wr <- w[Ri] * r[Ri]
+    
+    denom <- sum(wr)
+    if (!is.finite(denom) || denom <= 0) next
+    
+    Ezj <- sum(x[Ri, j] * wr) / denom
+    score <- score + w[i] * (x[i, j] - Ezj)
+  }
+  score
+}
+
+
+# ==================
+# 3) matsplitter
+# ==================
+# Split a (q^2 x q^2) matrix into a list of q^2 blocks, each (q x q).
+# This is strict on dimensions to avoid silent misuse.
+matsplitter <- function(M, q) {
+  nr <- nrow(M); nc <- ncol(M)
+  if (nr != q * q || nc != q * q) {
+    stop(sprintf("matsplitter: expected a %d x %d matrix; got %d x %d",
+                 q*q, q*q, nr, nc))
+  }
+  blocks <- vector("list", q * q)
+  for (i in seq_len(q)) {
+    for (j in seq_len(q)) {
+      r <- ((i - 1) * q + 1):(i * q)
+      c <- ((j - 1) * q + 1):(j * q)
+      blocks[[ (i - 1) * q + j ]] <- M[r, c, drop = FALSE]
+    }
+  }
+  blocks
+}
+
+
+# =========================
+# 4) covStartingValues (Cox)
+# =========================
+# Scalar frailty variance init via Laplace-approximated Cox marginal loglik.
+# Parameterization: D = tau^2 * I_q with tau = exp(gamma).
+covStartingValues <- function(xGroup, yGroup, zGroup, zIdGroup,  # zIdGroup kept for signature compatibility
+                              b, N,
+                              wGroup = NULL,
+                              lower = -6, upper = 2,
+                              ridge = 1e-6) {
+  if (length(zGroup) == 0L || ncol(zGroup[[1]]) == 0L) {
+    return(list(tau = 0, sigma = NA_real_, opt = NA_real_))
+  }
+  q <- ncol(zGroup[[1]])
+  
+  # Objective for optimize(): minimize negative Laplace loglik
+  nll <- function(gamma) {
+    tau2 <- exp(2 * gamma)
+    D    <- diag(tau2, q)
+    out  <- tryCatch(
+      cox_laplace_loglik(
+        xGroup = xGroup, yGroup = yGroup, zGroup = zGroup,
+        beta = b, D = D, wGroup = wGroup, ridge = ridge
+      )$loglik,
+      error = function(e) -1e6
+    )
+    # We minimize
+    if (!is.finite(out)) out <- -1e6
+    -out
+  }
+  
+  opt <- optimize(nll, interval = c(lower, upper))
+  gamma_hat <- opt$minimum
+  tau_hat   <- exp(gamma_hat)
+  
+  list(tau = tau_hat, sigma = NA_real_, opt = opt$objective)
+}
+
 
 
 ZIdentity <- function(Z) {
@@ -42,54 +196,6 @@ ZIdentity <- function(Z) {
 }
 
 
-covStartingValues <- function(xGroup,yGroup,zGroup,zIdGroup,b,N,lower=-10,upper=10)
-{
-  optimize1 <- function(x,y,b) y-x%*%b
-  
-  optimize2 <- function(gamma,zId,ZtZ)
-  {
-    H <- zId + exp(2*gamma)*ZtZ
-    return(list(H=H))
-  }
-  
-  optimize3 <- function(res,zId,ZtZ,gamma)
-  {
-    lambda <- optimize2(gamma,zId,ZtZ)
-    logdetH <- determinant(lambda$H)$modulus
-    quadH <- quad.form.inv(lambda$H,res)
-    return(c(logdetH,quadH))
-  }
-  
-  optimize4 <- function(gamma) {
-    optH <- mapply(optimize3, resGroup, zIdGroup, ZtZ = ztzGroup, MoreArgs = list(gamma = gamma))
-    H1 <- optH[1, ]
-    H2 <- optH[2, ]
-    
-    if (any(!is.finite(H2)) || sum(H2) <= 0) {
-      return(1e10)  # Large penalty instead of -Inf
-    }
-    
-    fn <- N * log(sum(H2)) + sum(H1)
-    return(fn)
-  }
-  
-  optimize5 <- function(z) tcrossprod(z)
-  
-  resGroup <- mapply(optimize1,x=xGroup,y=yGroup,MoreArgs=list(b=b),SIMPLIFY=FALSE)
-  ztzGroup <- mapply(optimize5,z=zGroup,SIMPLIFY=FALSE)
-  
-  optRes <- optimize(f=optimize4,interval=c(lower,upper))
-  
-  gamma <- optRes$minimum
-  
-  quadH <- mapply(optimize3,resGroup,zIdGroup,ztzGroup,MoreArgs=list(gamma=gamma))[2,]
-  
-  sig <- sqrt(1/N*sum(quadH))
-  tau <- exp(gamma)*sig
-  objfct <- 1/2*(optRes$objective + N*(1-log(N)))
-  
-  return(list(tau=tau,sigma=sig,opt=objfct))
-}
 
 
 nlogdet_Cox <- function(V_list) {
@@ -100,56 +206,22 @@ nlogdet_Cox <- function(V_list) {
 
 
 VInv <- function(x, y, z, beta, D) {
-  # Safety: Ensure all inputs are matrices
-  if (!is.matrix(x) || !is.matrix(y) || !is.matrix(z)) {
-    stop("Inputs x, y, and z must all be matrices.")
+  time <- y[,1]; event <- y[,2]
+  eta  <- as.vector(x %*% beta)
+  ord  <- order(time, -event)
+  time <- time[ord]; event <- event[ord]; z <- z[ord,,drop=FALSE]; eta <- eta[ord]
+  r    <- exp(eta)
+  
+  H <- matrix(0, ncol(z), ncol(z))
+  for (i in which(event == 1)) {
+    Ri <- which(time >= time[i])
+    w  <- r[Ri]
+    Zw <- sweep(z[Ri,,drop=FALSE], 1, w, `*`)
+    mu <- colSums(Zw) / sum(w)                 # E_w[z]
+    S2 <- crossprod(z[Ri,,drop=FALSE], Zw) / sum(w)   # E_w[zz^T]
+    H  <- H + (S2 - tcrossprod(mu))            # Var_w(z)
   }
-  
-  if (nrow(x) != nrow(y) || nrow(x) != nrow(z)) {
-    stop("x, y, and z must have the same number of rows.")
-  }
-  
-  # Compute linear predictor and risk
-  
-  
-  if (!is.matrix(x)) stop("x is not a matrix")
-  if (!is.numeric(x)) stop("x is not numeric")
-  if (!is.numeric(beta)) stop("beta is not numeric")
-  if (!is.vector(beta)) stop("beta is not a vector")
-  
-
-  
-  eta <- x %*% beta
-  risk <- exp(eta)
-  
-  # Order data by increasing survival time
-  ord <- order(y[, 1])
-  risk <- risk[ord]
-  z_ord <- z[ord, , drop = FALSE]
-  
-  # Compute risk weights
-  risk_cumsum <- rev(cumsum(rev(risk)))
-  risk_weights <- risk / risk_cumsum
-  risk_weights[!is.finite(risk_weights)] <- 0
-  
-  # Ensure risk_weights length matches z_ord rows
-  if (length(risk_weights) != nrow(z_ord)) {
-    warning("Mismatch between risk weights and z_ord. Returning identity matrix.")
-    return(diag(ncol(z)))
-  }
-  
-  # Construct diagonal weight matrix
-  W <- diag(risk_weights)
-  
-  # Compute Hessian-like term with error handling
-  H_u <- tryCatch({
-    t(z_ord) %*% W %*% z_ord + solve(D)
-  }, error = function(e) {
-    warning("Matrix multiplication or inversion failed in VInv: ", conditionMessage(e))
-    diag(ncol(z))  # Fallback: return identity
-  })
-  
-  return(H_u)
+  H + solve(D)
 }
 
 
@@ -179,35 +251,6 @@ VnotInv <- function(x, y, z, beta, D) {
 
 
 
-frailty_gradient_hessian <- function(x, y, z, beta, u) {
-  eta <- x %*% beta + z %*% u
-  risk <- exp(eta)
-  time <- y[, 1]
-  event <- y[, 2]
-  
-  n <- nrow(x)
-  grad <- matrix(0, ncol = ncol(z), nrow = 1)
-  hess <- matrix(0, ncol = ncol(z), nrow = ncol(z))
-  
-  for (i in which(event == 1)) {
-    # Risk set: those at risk at time[i]
-    Ri <- which(time >= time[i])
-    w <- risk[Ri]
-    
-    # Weighted means over risk set
-    zw <- sweep(z[Ri,,drop=FALSE], 1, w, `*`)
-    Ewz <- colSums(zw) / sum(w)
-    
-    grad <- grad + (z[i,,drop=FALSE] - Ewz)
-    
-    # Hessian approximation
-    outer_Ewz <- tcrossprod(Ewz)
-    Ezz <- crossprod(sqrt(w) * z[Ri,,drop=FALSE]) / sum(w)
-    hess <- hess - (Ezz - outer_Ewz)
-  }
-  
-  return(list(grad = grad, hess = hess, eta = eta))
-}
 
 
 nlogdet <- function(LGroup)
@@ -222,90 +265,129 @@ nlogdet <- function(LGroup)
 
 
 
-cox_laplace_loglik <- function(xGroup, yGroup, zGroup, beta, D, tol = 1e-6, maxiter = 25) {
-  if (length(zGroup) == 0 || is.null(zGroup[[1]]) || !is.matrix(zGroup[[1]]) || ncol(zGroup[[1]]) == 0) {
-    warning("zGroup is malformed or empty in cox_laplace_loglik.")
-    return(list(loglik = -1e6, uhat = NA, Hessian = diag(1e-2, ncol(D))))
+cox_laplace_loglik <- function(xGroup, yGroup, zGroup, beta, D,
+                               wGroup = NULL, tol = 1e-6, maxiter = 50,
+                               ridge = 1e-6) {
+  # Stack per-subject lists
+  X <- do.call(rbind, xGroup)
+  Z <- do.call(rbind, zGroup)
+  Y <- do.call(rbind, yGroup)
+  
+  if (!is.matrix(X) || !is.matrix(Z) || !is.matrix(Y))
+    stop("xGroup/yGroup/zGroup must be lists of matrices that rbind cleanly.")
+  
+  n <- nrow(X); q <- ncol(Z)
+  if (q == 0L || n == 0L) return(list(loglik = -1e6, uhat = rep(0, 0), Hessian = matrix(,0,0)))
+  
+  # Weights (soft memberships). Accept vector or list; default 1.
+  if (is.null(wGroup)) {
+    w <- rep(1, n)
+  } else if (is.list(wGroup)) {
+    w <- as.numeric(unlist(wGroup))
+  } else {
+    w <- as.numeric(wGroup)
+  }
+  if (length(w) != n) {
+    warning("wGroup length mismatch; using equal weights.")
+    w <- rep(1, n)
   }
   
-  q <- ncol(zGroup[[1]])
+  # Order by time asc, break ties by events first (Breslow-like)
+  time  <- Y[, 1]
+  event <- Y[, 2]
+  ord   <- order(time, -event)
+  X <- X[ord, , drop = FALSE]
+  Z <- Z[ord, , drop = FALSE]
+  time  <- time[ord]
+  event <- event[ord]
+  w     <- w[ord]
+  
+  # Safe inverse for D
+  D_inv <- tryCatch(solve(D), error = function(e) solve(D + diag(ridge, nrow(D))))
+  
   u <- rep(0, q)
   
-  for (iter in 1:maxiter) {
-    grad_sum <- matrix(0, nrow = 1, ncol = q)
-    hess_sum <- matrix(0, nrow = q, ncol = q)
+  # Helper: compute weighted Cox loglik, grad_u, hess_u for current u
+  w_cox_stats <- function(u) {
+    eta <- as.vector(X %*% beta + Z %*% u)
+    r   <- exp(eta)
     
-    for (i in seq_along(xGroup)) {
-      out <- frailty_gradient_hessian(xGroup[[i]], yGroup[[i]], zGroup[[i]], beta, u)
-      grad_sum <- grad_sum + out$grad
-      hess_sum <- hess_sum + out$hess
+    loglik <- 0
+    grad   <- numeric(q)
+    hess   <- matrix(0, q, q)
+    
+    # Loop over event times; Breslow weighting with case-weights w
+    ev_idx <- which(event == 1)
+    for (i in ev_idx) {
+      Ri <- which(time >= time[i])
+      
+      wr   <- w[Ri] * r[Ri]
+      denom <- sum(wr)
+      if (!is.finite(denom) || denom <= 0) next
+      
+      Zi <- Z[Ri, , drop = FALSE]
+      mu <- colSums(Zi * wr) / denom                         # E_w[Z]
+      # E_w[ZZ^T]
+      Ezz <- crossprod(Zi, Zi * (wr / denom))
+      
+      loglik <- loglik + w[i] * (eta[i] - log(denom))
+      grad   <- grad + w[i] * (Z[i, ] - mu)
+      hess   <- hess - w[i] * (Ezz - tcrossprod(mu))
     }
     
-    D_inv <- tryCatch({
-      solve(D)
-    }, error = function(e) {
-      warning("D is near-singular; applying ridge regularization")
-      solve(D + diag(1e-6, nrow(D)))
-    })
+    list(loglik = loglik, grad = grad, hess = hess)
+  }
+  
+  # Newton on log posterior: ℓ(u) - 1/2 uᵀD^{-1}u
+  for (iter in seq_len(maxiter)) {
+    s   <- w_cox_stats(u)
+    g   <- s$grad - as.vector(D_inv %*% u)        # gradient of log posterior
+    H   <- s$hess - D_inv                         # Hessian  of log posterior (negative-definite)
     
-    penalized_grad <- grad_sum - t(u) %*% D_inv
-    penalized_hess <- hess_sum - D_inv
-    
-    if (anyNA(penalized_hess) || any(!is.finite(penalized_hess))) {
-      warning("Non-finite penalized Hessian — skipping Laplace update")
-      return(list(loglik = -1e6, uhat = rep(0, q), Hessian = diag(1e-2, q)))
+    if (any(!is.finite(g)) || any(!is.finite(H))) {
+      warning("Non-finite grad/Hess in cox_laplace_loglik; aborting NR.")
+      break
     }
     
-    if (anyNA(penalized_grad) || any(!is.finite(penalized_grad))) {
-      stop("Non-finite penalized gradient")
-    }
-    
-    penalized_hess_stable <- penalized_hess + diag(1e-6, q)
-    
-    step <- tryCatch({
-      solve(penalized_hess_stable, t(penalized_grad))
-    }, error = function(e) {
-      warning("solve() failed in Laplace update; returning NA step")
-      return(rep(NA, ncol(penalized_grad)))
-    })
-    
+    H_stable <- H + diag(ridge, q)
+    step <- tryCatch(solve(H_stable, g), error = function(e) rep(NA_real_, q))
     if (anyNA(step)) {
-      warning("Skipping update due to invalid step")
+      warning("solve() failed in cox_laplace_loglik; aborting NR.")
       break
     }
     
-    u_new <- u - as.vector(step)
-    
-    if (max(abs(u_new - u)) < tol) {
-      u <- u_new
-      break
-    }
-    
+    u_new <- as.vector(u - step)
+    if (max(abs(u_new - u)) < tol) { u <- u_new; break }
     u <- u_new
   }
   
-  # Final Laplace correction
-  H_u <- hess_sum + D_inv
+  # Final stats at û
+  s_final <- w_cox_stats(u)
+  # Negative Hessian of log posterior at û (must be PD for Laplace)
+  H_neg <- -(s_final$hess - D_inv)
   
-  logdetHu <- tryCatch({
-    determinant(H_u, logarithm = TRUE)$modulus[1]
-  }, error = function(e) {
-    warning("Determinant failed; using fallback")
-    1e-6
-  })
+  # Stabilize if necessary
+  if (any(!is.finite(H_neg))) H_neg <- H_neg + diag(ridge, q)
   
-  quad_penalty <- t(u) %*% D_inv %*% u
+  logdetHu <- tryCatch(
+    determinant(H_neg, logarithm = TRUE)$modulus[1],
+    error = function(e) { warning("determinant(H_neg) failed; using fallback."); log(ridge) * q }
+  )
   
-  loglik <- 0
-  for (i in seq_along(xGroup)) {
-    eta <- xGroup[[i]] %*% beta + zGroup[[i]] %*% u
-    loglik <- loglik + cox_partial_loglik(yGroup[[i]], eta)
-  }
+  quad_pen <- as.numeric(t(u) %*% D_inv %*% u)
   
-  laplace_approx <- loglik - 0.5 * quad_penalty - 0.5 * logdetHu
+  laplace_approx <- as.numeric(s_final$loglik - 0.5 * quad_pen - 0.5 * logdetHu)
   
-  return(list(loglik = laplace_approx, uhat = u, Hessian = H_u))
+  if (!is.finite(laplace_approx)) laplace_approx <- -1e6
+  
+  list(loglik = laplace_approx, uhat = u, Hessian = H_neg)
 }
+
+
+
+
+
+
 
 
   
@@ -326,17 +408,8 @@ cox_partial_loglik <- function(y, eta) {
 }
 
 
-cox_partial_score_component <- function(x, y, beta, j) {
-  eta <- x %*% beta
-  event <- y[, 2]
-  risk <- exp(eta)
-  risk_set_sum <- rev(cumsum(rev(risk)))
-  weight <- risk / risk_set_sum
-  
-  weighted_means <- colSums(sweep(x, 1, weight, `*`))
-  score <- sum(event * (x[, j] - weighted_means[j]))
-  return(score)
-}
+
+
 
 
 
@@ -558,93 +631,99 @@ ResAsSplit <- function(x,y,b,f,activeset)
   return(resGroup)
 }
 
-D_Gradient <- function(xGroup, zGroup, LGroup, yGroup, b, N, verbose = FALSE) {
-  q <- ncol(zGroup[[1]])
-  mat <- matrix(0, nrow = q, ncol = q)
+# ---- Utility: expand weights from subjects -> rows ----
+.expand_weights <- function(wGroup, xGroup) {
+  if (is.null(wGroup)) {
+    # one row per subject assumed
+    return(rep(1, sum(vapply(xGroup, nrow, 1L))))
+  }
+  if (is.list(wGroup)) {
+    # list of scalars or vectors aligned with subjects
+    unlist(mapply(function(wi, xi) {
+      if (length(wi) == 1L) rep(wi, nrow(xi)) else wi
+    }, wGroup, xGroup, SIMPLIFY = FALSE), use.names = FALSE)
+  } else {
+    # numeric vector; recycle if needed
+    rep(wGroup, length.out = sum(vapply(xGroup, nrow, 1L)))
+  }
+}
+
+# ---- Sum of event-wise Var_w(z) (observed info in u-direction) ----
+D_Gradient <- function(xGroup, zGroup, LGroup = NULL, yGroup, b, N = NULL,
+                       wGroup = NULL, verbose = FALSE, ridge = 1e-10) {
+  # Stack lists
+  X <- do.call(rbind, xGroup)
+  Z <- do.call(rbind, zGroup)
+  Y <- do.call(rbind, yGroup)
   
-  for (i in seq_along(yGroup)) {
-    x_i <- xGroup[[i]]
-    z_i <- zGroup[[i]]
-    y_i <- yGroup[[i]]
+  if (!is.matrix(X) || !is.matrix(Z) || !is.matrix(Y))
+    stop("xGroup/zGroup/yGroup must rbind to matrices.")
+  
+  q <- ncol(Z)
+  if (q == 0L) return(matrix(0, 0, 0))
+  
+  w <- .expand_weights(wGroup, xGroup)
+  
+  time  <- Y[, 1]
+  event <- Y[, 2]
+  ord   <- order(time, -event)     # Breslow-like
+  X <- X[ord, , drop = FALSE]
+  Z <- Z[ord, , drop = FALSE]
+  time  <- time[ord]
+  event <- event[ord]
+  w     <- w[ord]
+  
+  eta <- as.vector(X %*% b)
+  r   <- exp(eta)
+  
+  G <- matrix(0, q, q)
+  ev_idx <- which(event == 1)
+  for (i in ev_idx) {
+    Ri <- which(time >= time[i])
     
-    # Skip empty groups
-    if (nrow(z_i) == 0 || nrow(x_i) == 0) next
+    wr    <- w[Ri] * r[Ri]
+    denom <- sum(wr)
+    if (!is.finite(denom) || denom <= 0) next
     
-    # Linear predictor and risk
-    eta_i <- x_i %*% b
-    risk <- as.numeric(exp(eta_i))
+    Zi <- Z[Ri, , drop = FALSE]
+    mu <- colSums(Zi * wr) / denom                     # E_w[Z]
+    Ezz <- crossprod(Zi, Zi * (wr / denom))            # E_w[ZZ^T]
+    VarZ <- Ezz - tcrossprod(mu)
     
-    if (!all(is.finite(risk)) || length(risk) == 0) {
-      if (verbose) warning(paste("Skipping group", i, "- invalid risk"))
-      next
-    }
-    
-    # Cumulative risk with stability adjustment
-    risk_sum <- rev(cumsum(rev(risk)))
-    risk_sum[risk_sum == 0] <- 1e-10
-    w <- risk / risk_sum
-    
-    # Final check for weight vector
-    if (!all(is.finite(w)) || length(w) == 0 || any(is.na(w))) {
-      if (verbose) warning(paste("Skipping group", i, "- invalid weights"))
-      next
-    }
-    
-    # Weighted Z^T W Z
-    W <- diag(w, nrow = length(w), ncol = length(w))
-    ztwz <- t(z_i) %*% W %*% z_i
-    mat <- mat + ztwz
+    # Weight this event's contribution by the event weight
+    G <- G + w[i] * VarZ
   }
   
-  return(mat)
+  # Numerical guard: symmetrize & ridge if needed
+  G <- (G + t(G)) / 2
+  if (any(!is.finite(G))) {
+    if (verbose) warning("Non-finite entries in D_Gradient; applying ridge.")
+    G[!is.finite(G)] <- 0
+    G <- G + diag(ridge, q)
+  }
+  G
+}
+
+# ---- Same structure for a curvature proxy; PSD and symmetric ----
+D_HessianMatrix <- function(xGroup, zGroup, LGroup = NULL, yGroup, b, N = NULL,
+                            q = ncol(zGroup[[1]]), wGroup = NULL,
+                            verbose = FALSE, ridge = 1e-10) {
+  # Use the same event-wise Var_w(z) accumulation as a stable curvature proxy.
+  H <- D_Gradient(xGroup = xGroup, zGroup = zGroup, LGroup = LGroup,
+                  yGroup = yGroup, b = b, N = N, wGroup = wGroup,
+                  verbose = verbose, ridge = ridge)
+  
+  # Ensure symmetry/PSD
+  H <- (H + t(H)) / 2
+  eig <- tryCatch(eigen(H, symmetric = TRUE, only.values = TRUE)$values,
+                  error = function(e) NA_real_)
+  if (any(is.na(eig)) || min(eig) < ridge)
+    H <- H + diag(ridge - min(0, min(eig, na.rm = TRUE)) + ridge, nrow(H))
+  
+  H
 }
 
 
-  
-
-
-
-D_HessianMatrix <- function(xGroup, zGroup, LGroup, yGroup, b, N, q, verbose = FALSE) {
-  hessian <- matrix(0, nrow = q, ncol = q)
-  
-  for (i in seq_along(yGroup)) {
-    x_i <- xGroup[[i]]
-    z_i <- zGroup[[i]]
-    y_i <- yGroup[[i]]
-    
-    # Skip if any input is empty
-    if (nrow(z_i) == 0 || nrow(x_i) == 0 || length(y_i) == 0) next
-    
-    time <- y_i[, 1]
-    event <- y_i[, 2]
-    
-    eta_i <- x_i %*% b
-    risk <- as.numeric(exp(eta_i))
-    
-    if (!all(is.finite(risk)) || length(risk) == 0) {
-      if (verbose) warning(paste("Skipping group", i, "- invalid risk"))
-      next
-    }
-    
-    risk_sum <- rev(cumsum(rev(risk)))
-    risk_sum[risk_sum == 0] <- 1e-10
-    w <- risk / risk_sum
-    
-    # Validate w before forming diag
-    if (anyNA(w) || any(!is.finite(w)) || length(w) != length(risk)) {
-      if (verbose) warning(paste("Skipping group", i, "- invalid weights"))
-      next
-    }
-    
-    # Safe diagonal matrix creation
-    W <- diag(w, nrow = length(w), ncol = length(w))
-    
-    ztwz <- t(z_i) %*% W %*% z_i
-    hessian <- hessian + ztwz
-  }
-  
-  return(hessian)
-}
 
 
 
@@ -656,22 +735,6 @@ D_HessianMatrix <- function(xGroup, zGroup, LGroup, yGroup, b, N, q, verbose = F
 
 
 
-
-
-matsplitter <- function(M, q) {
-  n_blocks <- q * q
-  block_list <- vector("list", n_blocks)
-  
-  for (i in 1:q) {
-    for (j in 1:q) {
-      idx <- (i - 1) * q + j
-      row_idx <- ((i - 1) * q + 1):(i * q)
-      col_idx <- ((j - 1) * q + 1):(j * q)
-      block_list[[idx]] <- M[row_idx, col_idx, drop = FALSE]
-    }
-  }
-  return(block_list)
-}
 
 
 
