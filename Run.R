@@ -21,13 +21,13 @@ length(unique(grp))
 length(levels(grp))
 
 
-# Covariates (fixed effects)
+# Covariates
 x <- as.matrix(data3[, grep("^x\\.", names(data3))])  # already includes x.1 (intercept)
 z <- as.matrix(data3[, grep("^z\\.", names(data3))])  # already includes z.1 (intercept)
-
+# Response
 y <- Surv(time, event)
 
-# Step 4: Run the clustering model
+# Run the clustering model
 fit <- clustercox(
   x = x,
   z = z,
@@ -39,14 +39,14 @@ fit <- clustercox(
   nCluster = 2,
   nonpen.b = 1,
   nonpen.L = 1,
-  penalty.b = "scad",
+  penalty.b = "lasso",
   penalty.L = "lasso",
   standardize = TRUE,
   control = spCoxControl()
 )
 
 
-# Step 5: View the results
+# View the results
 str(fit)
 
 

@@ -264,22 +264,25 @@ nlogdet <- function(LGroup)
 }
 
 
+# Efron
 
 cox_laplace_loglik <- function(xGroup, yGroup, zGroup, beta, D,
                                wGroup = NULL, tol = 1e-6, maxiter = 50,
-                               ridge = 1e-6) {
+                               ridge = 1e-6,
+                               ties = c("efron","breslow")) {
+  ties <- match.arg(ties)
+  
   # Stack per-subject lists
   X <- do.call(rbind, xGroup)
   Z <- do.call(rbind, zGroup)
   Y <- do.call(rbind, yGroup)
-  
   if (!is.matrix(X) || !is.matrix(Z) || !is.matrix(Y))
     stop("xGroup/yGroup/zGroup must be lists of matrices that rbind cleanly.")
   
   n <- nrow(X); q <- ncol(Z)
   if (q == 0L || n == 0L) return(list(loglik = -1e6, uhat = rep(0, 0), Hessian = matrix(,0,0)))
   
-  # Weights (soft memberships). Accept vector or list; default 1.
+  # Weights
   if (is.null(wGroup)) {
     w <- rep(1, n)
   } else if (is.list(wGroup)) {
@@ -292,7 +295,7 @@ cox_laplace_loglik <- function(xGroup, yGroup, zGroup, beta, D,
     w <- rep(1, n)
   }
   
-  # Order by time asc, break ties by events first (Breslow-like)
+  # Order by time asc, break ties by events first
   time  <- Y[, 1]
   event <- Y[, 2]
   ord   <- order(time, -event)
@@ -307,38 +310,91 @@ cox_laplace_loglik <- function(xGroup, yGroup, zGroup, beta, D,
   
   u <- rep(0, q)
   
-  # Helper: compute weighted Cox loglik, grad_u, hess_u for current u
+  # --- Efron/Breslow partial loglik + score/Hessian w.r.t u ---
   w_cox_stats <- function(u) {
     eta <- as.vector(X %*% beta + Z %*% u)
     r   <- exp(eta)
+    wr  <- w * r
     
     loglik <- 0
     grad   <- numeric(q)
     hess   <- matrix(0, q, q)
     
-    # Loop over event times; Breslow weighting with case-weights w
-    ev_idx <- which(event == 1)
-    for (i in ev_idx) {
-      Ri <- which(time >= time[i])
+    # Unique event times
+    ev_times <- sort(unique(time[event == 1]))
+    for (t in ev_times) {
+      Et <- which(time == t & event == 1)        # indices of failures at t
+      dt <- length(Et)
+      Rt <- which(time >= t)                     # risk set just before t
       
-      wr   <- w[Ri] * r[Ri]
-      denom <- sum(wr)
-      if (!is.finite(denom) || denom <= 0) next
+      # risk-set sums (weighted by wr)
+      R_denom <- sum(wr[Rt])
+      if (!is.finite(R_denom) || R_denom <= 0) next
       
-      Zi <- Z[Ri, , drop = FALSE]
-      mu <- colSums(Zi * wr) / denom                         # E_w[Z]
-      # E_w[ZZ^T]
-      Ezz <- crossprod(Zi, Zi * (wr / denom))
+      Z_R <- Z[Rt, , drop = FALSE]
+      Z_E <- Z[Et, , drop = FALSE]
       
-      loglik <- loglik + w[i] * (eta[i] - log(denom))
-      grad   <- grad + w[i] * (Z[i, ] - mu)
-      hess   <- hess - w[i] * (Ezz - tcrossprod(mu))
+      # first moments (numerators): sum wr * Z
+      numZ_R <- colSums(Z_R * wr[Rt])
+      numZ_E <- if (dt > 0) colSums(Z_E * wr[Et]) else rep(0, q)
+      
+      # second moments (numerators): sum wr * Z Z^T
+      M2_R <- crossprod(Z_R, Z_R * wr[Rt])
+      M2_E <- if (dt > 0) crossprod(Z_E, Z_E * wr[Et]) else matrix(0, q, q)
+      
+      # Numerator contribution from failures to loglik
+      loglik <- loglik + sum(w[Et] * eta[Et])
+      
+      if (ties == "breslow" || dt == 1) {
+        # Breslow (or single failure)
+        denom <- R_denom
+        if (!is.finite(denom) || denom <= 0) next
+        
+        EZ   <- numZ_R / denom
+        EZZ  <- M2_R   / denom
+        CovZ <- EZZ - tcrossprod(EZ)
+        
+        grad <- grad + colSums(Z[Et, , drop = FALSE] * w[Et]) - EZ
+        hess <- hess - CovZ
+        
+        if (ties == "breslow") {
+          # subtract dt * log(denom) for dt failures
+          loglik <- loglik - dt * log(denom)
+        } else { # dt==1 case already covered: subtract log(denom)
+          loglik <- loglik - log(denom)
+        }
+      } else {
+        # Efron: sum over k = 0..dt-1
+        F_denom <- sum(wr[Et])  # sum of wr over the tied failures
+        numZ_E2 <- numZ_E
+        M2_E2   <- M2_E
+        
+        # add the score piece from failures once
+        grad <- grad + colSums(Z[Et, , drop = FALSE] * w[Et])
+        
+        for (k in 0:(dt - 1)) {
+          frac   <- k / dt
+          denomk <- R_denom - frac * F_denom
+          if (!is.finite(denomk) || denomk <= 0) next
+          
+          numZk  <- numZ_R - frac * numZ_E2
+          M2k    <- M2_R   - frac * M2_E2
+          
+          EZk    <- numZk / denomk
+          EZZk   <- M2k   / denomk
+          CovZk  <- EZZk - tcrossprod(EZk)
+          
+          loglik <- loglik - log(denomk)
+          grad   <- grad   - EZk
+          hess   <- hess   - CovZk
+        }
+      }
     }
     
     list(loglik = loglik, grad = grad, hess = hess)
   }
   
-  # Newton on log posterior: ℓ(u) - 1/2 uᵀD^{-1}u
+  # Newton on log posterior: ℓ_partial(u) - 1/2 uᵀ D^{-1} u
   for (iter in seq_len(maxiter)) {
     s   <- w_cox_stats(u)
     g   <- s$grad - as.vector(D_inv %*% u)        # gradient of log posterior
@@ -361,12 +417,10 @@ cox_laplace_loglik <- function(xGroup, yGroup, zGroup, beta, D,
     u <- u_new
   }
   
-  # Final stats at û
+  # Final Laplace pieces at û
   s_final <- w_cox_stats(u)
-  # Negative Hessian of log posterior at û (must be PD for Laplace)
-  H_neg <- -(s_final$hess - D_inv)
+  H_neg <- -(s_final$hess - D_inv)               # -∇² log posterior at û
   
-  # Stabilize if necessary
   if (any(!is.finite(H_neg))) H_neg <- H_neg + diag(ridge, q)
   
   logdetHu <- tryCatch(
@@ -375,13 +429,131 @@ cox_laplace_loglik <- function(xGroup, yGroup, zGroup, beta, D,
   )
   
   quad_pen <- as.numeric(t(u) %*% D_inv %*% u)
-  
   laplace_approx <- as.numeric(s_final$loglik - 0.5 * quad_pen - 0.5 * logdetHu)
-  
   if (!is.finite(laplace_approx)) laplace_approx <- -1e6
   
   list(loglik = laplace_approx, uhat = u, Hessian = H_neg)
 }
+
+
+## Breslow
+# cox_laplace_loglik <- function(xGroup, yGroup, zGroup, beta, D,
+#                                wGroup = NULL, tol = 1e-6, maxiter = 50,
+#                                ridge = 1e-6) {
+#   # Stack per-subject lists
+#   X <- do.call(rbind, xGroup)
+#   Z <- do.call(rbind, zGroup)
+#   Y <- do.call(rbind, yGroup)
+#   
+#   if (!is.matrix(X) || !is.matrix(Z) || !is.matrix(Y))
+#     stop("xGroup/yGroup/zGroup must be lists of matrices that rbind cleanly.")
+#   
+#   n <- nrow(X); q <- ncol(Z)
+#   if (q == 0L || n == 0L) return(list(loglik = -1e6, uhat = rep(0, 0), Hessian = matrix(,0,0)))
+#   
+#   # Weights (soft memberships). Accept vector or list; default 1.
+#   if (is.null(wGroup)) {
+#     w <- rep(1, n)
+#   } else if (is.list(wGroup)) {
+#     w <- as.numeric(unlist(wGroup))
+#   } else {
+#     w <- as.numeric(wGroup)
+#   }
+#   if (length(w) != n) {
+#     warning("wGroup length mismatch; using equal weights.")
+#     w <- rep(1, n)
+#   }
+#   
+#   # Order by time asc, break ties by events first (Breslow-like)
+#   time  <- Y[, 1]
+#   event <- Y[, 2]
+#   ord   <- order(time, -event)
+#   X <- X[ord, , drop = FALSE]
+#   Z <- Z[ord, , drop = FALSE]
+#   time  <- time[ord]
+#   event <- event[ord]
+#   w     <- w[ord]
+#   
+#   # Safe inverse for D
+#   D_inv <- tryCatch(solve(D), error = function(e) solve(D + diag(ridge, nrow(D))))
+#   
+#   u <- rep(0, q)
+#   
+#   # Helper: compute weighted Cox loglik, grad_u, hess_u for current u
+#   w_cox_stats <- function(u) {
+#     eta <- as.vector(X %*% beta + Z %*% u)
+#     r   <- exp(eta)
+#     
+#     loglik <- 0
+#     grad   <- numeric(q)
+#     hess   <- matrix(0, q, q)
+#     
+#     # Loop over event times; Breslow weighting with case-weights w
+#     ev_idx <- which(event == 1)
+#     for (i in ev_idx) {
+#       Ri <- which(time >= time[i])
+#       
+#       wr   <- w[Ri] * r[Ri]
+#       denom <- sum(wr)
+#       if (!is.finite(denom) || denom <= 0) next
+#       
+#       Zi <- Z[Ri, , drop = FALSE]
+#       mu <- colSums(Zi * wr) / denom                         # E_w[Z]
+#       # E_w[ZZ^T]
+#       Ezz <- crossprod(Zi, Zi * (wr / denom))
+#       
+#       loglik <- loglik + w[i] * (eta[i] - log(denom))
+#       grad   <- grad + w[i] * (Z[i, ] - mu)
+#       hess   <- hess - w[i] * (Ezz - tcrossprod(mu))
+#     }
+#     
+#     list(loglik = loglik, grad = grad, hess = hess)
+#   }
+#   
+#   # Newton on log posterior: ℓ(u) - 1/2 uᵀD^{-1}u
+#   for (iter in seq_len(maxiter)) {
+#     s   <- w_cox_stats(u)
+#     g   <- s$grad - as.vector(D_inv %*% u)        # gradient of log posterior
+#     H   <- s$hess - D_inv                         # Hessian  of log posterior (negative-definite)
+#     
+#     if (any(!is.finite(g)) || any(!is.finite(H))) {
+#       warning("Non-finite grad/Hess in cox_laplace_loglik; aborting NR.")
+#       break
+#     }
+#     
+#     H_stable <- H + diag(ridge, q)
+#     step <- tryCatch(solve(H_stable, g), error = function(e) rep(NA_real_, q))
+#     if (anyNA(step)) {
+#       warning("solve() failed in cox_laplace_loglik; aborting NR.")
+#       break
+#     }
+#     
+#     u_new <- as.vector(u - step)
+#     if (max(abs(u_new - u)) < tol) { u <- u_new; break }
+#     u <- u_new
+#   }
+#   
+#   # Final stats at û
+#   s_final <- w_cox_stats(u)
+#   # Negative Hessian of log posterior at û (must be PD for Laplace)
+#   H_neg <- -(s_final$hess - D_inv)
+#   
+#   # Stabilize if necessary
+#   if (any(!is.finite(H_neg))) H_neg <- H_neg + diag(ridge, q)
+#   
+#   logdetHu <- tryCatch(
+#     determinant(H_neg, logarithm = TRUE)$modulus[1],
+#     error = function(e) { warning("determinant(H_neg) failed; using fallback."); log(ridge) * q }
+#   )
+#   
+#   quad_pen <- as.numeric(t(u) %*% D_inv %*% u)
+#   
+#   laplace_approx <- as.numeric(s_final$loglik - 0.5 * quad_pen - 0.5 * logdetHu)
+#   
+#   if (!is.finite(laplace_approx)) laplace_approx <- -1e6
+#   
+#   list(loglik = laplace_approx, uhat = u, Hessian = H_neg)
+# }
 
 
 
@@ -915,4 +1087,36 @@ densityfunc <- function(xGrp, yGrp, V, b,ll1.tmp){
   -0.5*(logv+rtvr)-ll1.tmp*length(yGrp)
 }
 
+
+em_Q <- function(betaList, LList, membership, pi_vec, lam1_base, lam2_base) {
+  # membership: G x N; pi_vec: length G
+  # Effective lambdas scaled by cluster mass (your current scheme)
+  lam1_eff <- lam1_base * pi_vec
+  lam2_eff <- lam2_base * pi_vec
+  
+  # Parameter part: sum_g [ penalized (negative) Laplace objective with weights w_g ]
+  param_term <- sum(mapply(function(b, L, w, l1, l2) {
+    pen_obj(b, L, as.numeric(w), l1, l2)
+  }, betaList, LList, as.data.frame(t(membership)), lam1_eff, lam2_eff))
+  
+  # Mixing proportions part: - sum_{i,g} w_{ig} log pi_g
+  # (Add a small floor for numerical safety)
+  pi_safe <- pmax(pi_vec, 1e-12)
+  mix_term <- - sum(membership * log(pi_safe))  # membership is G x N
+  
+  param_term + mix_term
+}
+
+
+
+obj_with_mix <- function(betaList, LList, membership, pi_vec, lam1_eff, lam2_eff) {
+  # param part: sum_g [ - Laplace loglik_g (given w_g) + penalties_g ]
+  param_term <- sum(mapply(function(b, L, w, l1, l2) {
+    pen_obj(b, L, as.numeric(w), l1, l2)  # your pen_obj already = -ℓ_Laplace + penalties
+  }, betaList, LList, as.data.frame(t(membership)), lam1_eff, lam2_eff))
+  # mixing proportions part: - sum_{i,g} w_{ig} log pi_g
+  pi_safe <- pmax(pi_vec, 1e-12)
+  mix_term <- - sum(membership * log(pi_safe))  # membership is G x N
+  param_term + mix_term
+}
 
