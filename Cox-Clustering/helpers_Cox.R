@@ -1109,14 +1109,4 @@ em_Q <- function(betaList, LList, membership, pi_vec, lam1_base, lam2_base) {
 
 
 
-obj_with_mix <- function(betaList, LList, membership, pi_vec, lam1_eff, lam2_eff) {
-  # param part: sum_g [ - Laplace loglik_g (given w_g) + penalties_g ]
-  param_term <- sum(mapply(function(b, L, w, l1, l2) {
-    pen_obj(b, L, as.numeric(w), l1, l2)  # your pen_obj already = -ℓ_Laplace + penalties
-  }, betaList, LList, as.data.frame(t(membership)), lam1_eff, lam2_eff))
-  # mixing proportions part: - sum_{i,g} w_{ig} log pi_g
-  pi_safe <- pmax(pi_vec, 1e-12)
-  mix_term <- - sum(membership * log(pi_safe))  # membership is G x N
-  param_term + mix_term
-}
 
